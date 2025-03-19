@@ -1,42 +1,55 @@
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import cv2
 from ultralytics import YOLO
-import asyncio
 import os
 import uvicorn
+import asyncio
 
 # Check if running in Render (prevents webcam error)
 ON_RENDER = os.getenv("RENDER") is not None
 
 app = FastAPI()
 
-# Load YOLO model
-model = YOLO("best.pt")
+# Load YOLO model once (instead of reloading on every request)
+app.state.model = YOLO("best.pt")
 
-# OpenCV Video Capture (Only if running locally)
-cap = None
-if not ON_RENDER:
-    cap = cv2.VideoCapture(0)  # Access camera only when running locally
-
-detected_animal = ""
-frame_lock = asyncio.Lock()
+# Global variables
+detected_animals = []  # List to store detected animal details
 
 async def process_frame():
-    """Runs continuously to update detected_animal."""
-    global detected_animal
-    while True:
-        if cap is not None:
-            success, frame = cap.read()
-            if not success:
-                await asyncio.sleep(0.1)  # Prevents busy-wait loop
-                continue
+    """Continuously updates detected_animals asynchronously."""
+    global detected_animals
+    cap = None if ON_RENDER else cv2.VideoCapture(0)  # Open camera only if running locally
 
-            results = model.predict(frame)
-            for result in results:
-                for box in result.boxes:
-                    detected_animal = "Detected"
-        await asyncio.sleep(0.1)  # Prevents infinite loop CPU overload
+    try:
+        while True:
+            if cap and cap.isOpened():
+                success, frame = cap.read()
+                if not success:
+                    await asyncio.sleep(0.1)  # Prevents busy-waiting
+                    continue
+
+                results = app.state.model.predict(frame)
+
+                detected_animals = []  # Reset detected animals
+                for result in results:
+                    for box in result.boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box coordinates
+                        confidence = float(box.conf[0])  # Confidence score
+                        class_id = int(box.cls[0])  # Class index
+                        class_name = app.state.model.names[class_id]  # Get class name
+
+                        detected_animals.append({
+                            "class": class_name,
+                            "confidence": confidence,
+                            "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+                        })
+
+            await asyncio.sleep(0.1)  # Prevents high CPU usage
+    finally:
+        if cap:
+            cap.release()
 
 @app.get("/")
 def read_root():
@@ -44,19 +57,46 @@ def read_root():
 
 @app.get("/video")
 def video_feed():
+    """Stream video frames with bounding boxes drawn."""
     def generate_frames():
-        while True:
-            if cap is not None:
-                success, frame = cap.read()
-                if not success:
-                    continue
-                _, buffer = cv2.imencode(".jpg", frame)
-                yield (b"--frame\r\n"
-                       b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
+        cap = None if ON_RENDER else cv2.VideoCapture(0)
+        
+        try:
+            while True:
+                if cap and cap.isOpened():
+                    success, frame = cap.read()
+                    if not success:
+                        continue
+
+                    results = app.state.model.predict(frame)
+                    
+                    for result in results:
+                        for box in result.boxes:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            confidence = float(box.conf[0])
+                            class_id = int(box.cls[0])
+                            class_name = app.state.model.names[class_id]
+
+                            # Draw bounding box & label on frame
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            cv2.putText(frame, f"{class_name} {confidence:.2f}",
+                                        (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                    _, buffer = cv2.imencode(".jpg", frame)
+                    yield (b"--frame\r\n"
+                           b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
+        finally:
+            if cap:
+                cap.release()
 
     return StreamingResponse(generate_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
 
-# Start FastAPI server with correct port binding
+@app.get("/detect")
+def get_detections():
+    """Returns JSON response of detected animals."""
+    return JSONResponse(content={"detections": detected_animals})
+
+# Start FastAPI server
 if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 10000))  # Default to port 10000
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT, reload=True)
