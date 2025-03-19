@@ -15,30 +15,31 @@ app = FastAPI()
 app.state.model = YOLO("best.pt")
 
 # Global variables
-detected_animals = []  # List to store detected animal details
+app.state.detected_animals = []  # List to store detected animal details
+app.state.cap = None if ON_RENDER else cv2.VideoCapture(0)  # Open camera globally
 
 async def process_frame():
     """Continuously updates detected_animals asynchronously."""
-    global detected_animals
-    cap = None if ON_RENDER else cv2.VideoCapture(0)  # Open camera only if running locally
+    cap = app.state.cap
+    model = app.state.model
 
     try:
         while True:
             if cap and cap.isOpened():
                 success, frame = cap.read()
                 if not success:
-                    await asyncio.sleep(0.1)  # Prevents busy-waiting
+                    await asyncio.sleep(0.1)
                     continue
 
-                results = app.state.model.predict(frame)
+                results = model.predict(frame)
+                detected_animals = []
 
-                detected_animals = []  # Reset detected animals
                 for result in results:
                     for box in result.boxes:
                         x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box coordinates
                         confidence = float(box.conf[0])  # Confidence score
                         class_id = int(box.cls[0])  # Class index
-                        class_name = app.state.model.names[class_id]  # Get class name
+                        class_name = model.names[class_id]  # Get class name
 
                         detected_animals.append({
                             "class": class_name,
@@ -46,10 +47,23 @@ async def process_frame():
                             "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
                         })
 
-            await asyncio.sleep(0.1)  # Prevents high CPU usage
+                app.state.detected_animals = detected_animals  # Update global detection list
+
+            await asyncio.sleep(0.1)  # Prevent high CPU usage
     finally:
         if cap:
             cap.release()
+
+@app.on_event("startup")
+async def startup_event():
+    """Starts the background task for processing frames."""
+    asyncio.create_task(process_frame())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Releases the camera resource on shutdown."""
+    if app.state.cap:
+        app.state.cap.release()
 
 @app.get("/")
 def read_root():
@@ -59,8 +73,9 @@ def read_root():
 def video_feed():
     """Stream video frames with bounding boxes drawn."""
     def generate_frames():
-        cap = None if ON_RENDER else cv2.VideoCapture(0)
-        
+        cap = app.state.cap
+        model = app.state.model
+
         try:
             while True:
                 if cap and cap.isOpened():
@@ -68,14 +83,14 @@ def video_feed():
                     if not success:
                         continue
 
-                    results = app.state.model.predict(frame)
+                    results = model.predict(frame)
                     
                     for result in results:
                         for box in result.boxes:
                             x1, y1, x2, y2 = map(int, box.xyxy[0])
                             confidence = float(box.conf[0])
                             class_id = int(box.cls[0])
-                            class_name = app.state.model.names[class_id]
+                            class_name = model.names[class_id]
 
                             # Draw bounding box & label on frame
                             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -94,9 +109,9 @@ def video_feed():
 @app.get("/detect")
 def get_detections():
     """Returns JSON response of detected animals."""
-    return JSONResponse(content={"detections": detected_animals})
+    return JSONResponse(content={"detections": app.state.detected_animals})
 
 # Start FastAPI server
 if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 10000))  # Default to port 10000
-    uvicorn.run(app, host="0.0.0.0", port=PORT, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=PORT, reload=False)
