@@ -7,7 +7,7 @@ import os
 import uvicorn
 import asyncio
 
-# Check if running in Render (prevents webcam error)
+# Check if running in Render (prevents webcam errors)
 ON_RENDER = os.getenv("RENDER") is not None
 
 app = FastAPI()
@@ -21,38 +21,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load YOLO model once (instead of reloading on every request)
-app.state.model = YOLO("best.pt")
+# Load YOLO model once
+MODEL_PATH = "best.pt"
 
-# Use a video file instead of a webcam (fix for hosted servers)
-VIDEO_PATH = "sample_video.mp4"  # Upload this file to your server
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"❌ YOLO model not found at {MODEL_PATH}. Please check the path.")
+
+app.state.model = YOLO(MODEL_PATH)
+
+# Video source (Change `0` for webcam, or set a video file)
+VIDEO_PATH = "sample_video.mp4"
+if not os.path.exists(VIDEO_PATH):
+    print("⚠️ Video file not found! Using webcam instead.")
+    VIDEO_PATH = 0  # Use default webcam
+
 app.state.cap = cv2.VideoCapture(VIDEO_PATH)
 
-# Global variables
-detected_animals = []  # List to store detected animal details
+# Global variable to store detected animals
+detected_animals = []
 
 async def process_frame():
     """Continuously updates detected_animals asynchronously."""
     global detected_animals
-    cap = None if ON_RENDER else cv2.VideoCapture(VIDEO_PATH)  # Use video file instead of webcam
+    cap = None if ON_RENDER else cv2.VideoCapture(VIDEO_PATH)
 
     try:
         while True:
             if cap and cap.isOpened():
                 success, frame = cap.read()
                 if not success:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Restart video if ended
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
 
                 results = app.state.model.predict(frame)
 
-                detected_animals = []  # Reset detected animals
+                detected_animals = []
                 for result in results:
                     for box in result.boxes:
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box coordinates
-                        confidence = float(box.conf[0])  # Confidence score
-                        class_id = int(box.cls[0])  # Class index
-                        class_name = app.state.model.names[class_id]  # Get class name
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        confidence = float(box.conf[0])
+                        class_id = int(box.cls[0])
+                        class_name = app.state.model.names[class_id]
 
                         detected_animals.append({
                             "class": class_name,
@@ -60,31 +69,34 @@ async def process_frame():
                             "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
                         })
 
-            await asyncio.sleep(0.1)  # Prevents high CPU usage
+            await asyncio.sleep(0.1)
     finally:
         if cap:
             cap.release()
 
 @app.get("/")
 def read_root():
-    return {"message": "Animal Detection API Running!"}
+    return {"message": "✅ Animal Detection API is running!"}
 
 @app.get("/video")
 def video_feed():
     """Stream video frames with bounding boxes drawn."""
     def generate_frames():
         cap = None if ON_RENDER else cv2.VideoCapture(VIDEO_PATH)
-        
+        print("🚀 Starting video stream...")
+
         try:
             while True:
                 if cap and cap.isOpened():
                     success, frame = cap.read()
                     if not success:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Restart video if ended
+                        print("🔄 Restarting video...")
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
 
                     results = app.state.model.predict(frame)
-                    
+                    print(f"🎯 Detected objects: {results}")
+
                     for result in results:
                         for box in result.boxes:
                             x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -92,7 +104,7 @@ def video_feed():
                             class_id = int(box.cls[0])
                             class_name = app.state.model.names[class_id]
 
-                            # Draw bounding box & label on frame
+                            # Draw bounding box
                             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                             cv2.putText(frame, f"{class_name} {confidence:.2f}",
                                         (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
@@ -103,6 +115,7 @@ def video_feed():
         finally:
             if cap:
                 cap.release()
+            print("❌ Stopping video stream.")
 
     return StreamingResponse(generate_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
 
@@ -111,10 +124,10 @@ def get_detections():
     """Returns JSON response of detected animals."""
     return JSONResponse(content={"detections": detected_animals})
 
-# WebSocket for alternative video streaming (optional)
+# WebSocket for real-time video streaming
 @app.websocket("/ws/video")
 async def websocket_video(websocket: WebSocket):
-    """WebSocket for real-time video streaming (alternative approach)."""
+    """WebSocket for real-time video streaming."""
     await websocket.accept()
     cap = cv2.VideoCapture(VIDEO_PATH)
 
@@ -128,7 +141,6 @@ async def websocket_video(websocket: WebSocket):
 
                 results = app.state.model.predict(frame)
 
-                # Draw bounding boxes
                 for result in results:
                     for box in result.boxes:
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -151,4 +163,5 @@ async def websocket_video(websocket: WebSocket):
 # Start FastAPI server
 if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 10000))  # Default to port 10000
+    print(f"🚀 Server running at http://127.0.0.1:{PORT}/")
     uvicorn.run(app, host="0.0.0.0", port=PORT, reload=True)
