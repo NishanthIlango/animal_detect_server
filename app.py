@@ -5,14 +5,15 @@ import cv2
 from ultralytics import YOLO
 import os
 import uvicorn
+import threading
 import asyncio
 
-# Check if running in Render (prevents webcam errors)
+# Check if running in a hosted environment
 ON_RENDER = os.getenv("RENDER") is not None
 
 app = FastAPI()
 
-# Enable CORS (fixes issues with hosted access)
+# Enable CORS for frontend access (update with actual frontend URL if needed)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Change this to your frontend URL if needed
@@ -21,101 +22,59 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load YOLO model once
-MODEL_PATH = "best.pt"
+# Load YOLO model (make sure 'best.pt' is present)
+app.state.model = YOLO("best.pt")
 
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"❌ YOLO model not found at {MODEL_PATH}. Please check the path.")
-
-app.state.model = YOLO(MODEL_PATH)
-
-# Video source (Change `0` for webcam, or set a video file)
-VIDEO_PATH = "sample_video.mp4"
-if not os.path.exists(VIDEO_PATH):
-    print("⚠️ Video file not found! Using webcam instead.")
-    VIDEO_PATH = 0  # Use default webcam
-
+# Use a video file instead of a webcam (Change to 0 for webcam)
+VIDEO_PATH = 0  # Set to 0 for webcam
 app.state.cap = cv2.VideoCapture(VIDEO_PATH)
 
-# Global variable to store detected animals
-detected_animals = []
+# Global variables
+detected_animals = []  # Stores detected animal details
 
-async def process_frame():
-    """Continuously updates detected_animals asynchronously."""
-    global detected_animals
-    cap = None if ON_RENDER else cv2.VideoCapture(VIDEO_PATH)
+def read_frames():
+    """Continuously reads frames in a background thread to prevent timeouts."""
+    global app
+    while True:
+        success, _ = app.state.cap.read()
+        if not success:
+            app.state.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Restart video if ended
 
-    try:
-        while True:
-            if cap and cap.isOpened():
-                success, frame = cap.read()
-                if not success:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
-
-                results = app.state.model.predict(frame)
-
-                detected_animals = []
-                for result in results:
-                    for box in result.boxes:
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        confidence = float(box.conf[0])
-                        class_id = int(box.cls[0])
-                        class_name = app.state.model.names[class_id]
-
-                        detected_animals.append({
-                            "class": class_name,
-                            "confidence": confidence,
-                            "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
-                        })
-
-            await asyncio.sleep(0.1)
-    finally:
-        if cap:
-            cap.release()
+# Start background frame reader in a separate thread
+threading.Thread(target=read_frames, daemon=True).start()
 
 @app.get("/")
 def read_root():
-    return {"message": "✅ Animal Detection API is running!"}
+    return {"message": "Animal Detection API Running!"}
 
 @app.get("/video")
 def video_feed():
     """Stream video frames with bounding boxes drawn."""
     def generate_frames():
-        cap = None if ON_RENDER else cv2.VideoCapture(VIDEO_PATH)
-        print("🚀 Starting video stream...")
+        while True:
+            success, frame = app.state.cap.read()
+            if not success:
+                print("⚠️ Frame not received! Retrying...")
+                continue
 
-        try:
-            while True:
-                if cap and cap.isOpened():
-                    success, frame = cap.read()
-                    if not success:
-                        print("🔄 Restarting video...")
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        continue
+            # Run YOLO detection
+            results = app.state.model.predict(frame)
 
-                    results = app.state.model.predict(frame)
-                    print(f"🎯 Detected objects: {results}")
+            for result in results:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box coordinates
+                    confidence = float(box.conf[0])  # Confidence score
+                    class_id = int(box.cls[0])  # Class index
+                    class_name = app.state.model.names[class_id]  # Get class name
 
-                    for result in results:
-                        for box in result.boxes:
-                            x1, y1, x2, y2 = map(int, box.xyxy[0])
-                            confidence = float(box.conf[0])
-                            class_id = int(box.cls[0])
-                            class_name = app.state.model.names[class_id]
+                    # Draw bounding box and label
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, f"{class_name} {confidence:.2f}",
+                                (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-                            # Draw bounding box
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                            cv2.putText(frame, f"{class_name} {confidence:.2f}",
-                                        (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-                    _, buffer = cv2.imencode(".jpg", frame)
-                    yield (b"--frame\r\n"
-                           b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
-        finally:
-            if cap:
-                cap.release()
-            print("❌ Stopping video stream.")
+            _, buffer = cv2.imencode(".jpg", frame)
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
 
     return StreamingResponse(generate_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
 
@@ -124,44 +83,38 @@ def get_detections():
     """Returns JSON response of detected animals."""
     return JSONResponse(content={"detections": detected_animals})
 
-# WebSocket for real-time video streaming
 @app.websocket("/ws/video")
 async def websocket_video(websocket: WebSocket):
-    """WebSocket for real-time video streaming."""
+    """WebSocket for real-time video streaming (alternative approach)."""
     await websocket.accept()
-    cap = cv2.VideoCapture(VIDEO_PATH)
+    
+    while True:
+        success, frame = app.state.cap.read()
+        if not success:
+            app.state.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
 
-    try:
-        while True:
-            if cap.isOpened():
-                success, frame = cap.read()
-                if not success:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
+        # Run YOLO detection
+        results = app.state.model.predict(frame)
 
-                results = app.state.model.predict(frame)
+        # Draw bounding boxes
+        for result in results:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                confidence = float(box.conf[0])
+                class_id = int(box.cls[0])
+                class_name = app.state.model.names[class_id]
 
-                for result in results:
-                    for box in result.boxes:
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        confidence = float(box.conf[0])
-                        class_id = int(box.cls[0])
-                        class_name = app.state.model.names[class_id]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f"{class_name} {confidence:.2f}",
+                            (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.putText(frame, f"{class_name} {confidence:.2f}",
-                                    (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        _, buffer = cv2.imencode(".jpg", frame)
+        await websocket.send_bytes(buffer.tobytes())
 
-                _, buffer = cv2.imencode(".jpg", frame)
-                await websocket.send_bytes(buffer.tobytes())
-
-            await asyncio.sleep(0.1)
-    finally:
-        cap.release()
-        await websocket.close()
+        await asyncio.sleep(0.1)
 
 # Start FastAPI server
 if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 10000))  # Default to port 10000
-    print(f"🚀 Server running at http://127.0.0.1:{PORT}/")
+    PORT = int(os.environ.get("PORT", 10000))  # Default port 10000
     uvicorn.run(app, host="0.0.0.0", port=PORT, reload=True)
